@@ -2,13 +2,6 @@ name: Build SDL3 for iOS
 
 # 构建 iOS arm64 版 libSDL3.dylib，供 PojavLauncher (Amethyst iOS) 集成使用。
 # LWJGL 的 Library.loadNative 期望加载动态库，iOS 支持嵌入动态库。
-#
-# 关键配置：
-# - CMAKE_SYSTEM_NAME=iOS 交叉编译
-# - CMAKE_OSX_ARCHITECTURES=arm64
-# - CMAKE_OSX_DEPLOYMENT_TARGET=14.0 匹配项目最低支持
-# - SDL_SHARED=ON 构建动态库
-# - SDL_MAIN_HANDLED=ON 禁用 SDL main hook（MC 自己管理 main）
 
 on:
   push:
@@ -82,19 +75,33 @@ jobs:
       - name: Build libSDL3.dylib
         run: cmake --build build-ios --config ${{ github.event.inputs.build_type || 'Release' }} --parallel 4 --verbose
 
-      - name: Verify dylib architecture
+      - name: Verify and package dylib
         run: |
           echo "=== Build output ==="
-          find build-ios -name "libSDL3*" -type f 2>/dev/null
+          find build-ios -name "libSDL3*" 2>/dev/null
           echo ""
-          DYLIB=$(find build-ios -name "libSDL3.dylib" -type f | head -1)
+          # libSDL3.dylib 可能是符号链接（指向 libSDL3.0.dylib），用 -L 跟随符号链接
+          DYLIB=$(find build-ios -name "libSDL3.dylib" 2>/dev/null | head -1)
+          if [ -z "$DYLIB" ]; then
+            DYLIB=$(find build-ios -name "libSDL3.*.dylib" 2>/dev/null | head -1)
+          fi
           if [ -n "$DYLIB" ]; then
-            file "$DYLIB"
+            echo "Found: $DYLIB"
+            file -L "$DYLIB"
             echo ""
+            echo "=== otool -L ==="
             otool -L "$DYLIB" | head -20
             echo ""
             echo "=== Exported symbols (sample) ==="
             nm -gU "$DYLIB" 2>/dev/null | grep -E "SDL_SetLogPriorities|SDL_Init|SDL_Quit|SDL_CreateWindow" | head -10
+            # 如果是符号链接，复制实际文件（保留 dylib 名称）
+            mkdir -p artifacts
+            cp -RL "$DYLIB" artifacts/libSDL3.dylib
+            # 同时复制版本号 dylib（如果是真实文件）
+            VERSIONED=$(find build-ios -name "libSDL3.*.dylib" -type f 2>/dev/null | head -1)
+            if [ -n "$VERSIONED" ] && [ "$VERSIONED" != "$DYLIB" ]; then
+              cp -L "$VERSIONED" artifacts/$(basename "$VERSIONED")
+            fi
           else
             echo "ERROR: libSDL3.dylib not found"
             find build-ios -name "*.dylib" -o -name "*.a" 2>/dev/null
@@ -103,15 +110,11 @@ jobs:
 
       - name: Sign dylib (ad-hoc for iOS)
         run: |
-          DYLIB=$(find build-ios -name "libSDL3.dylib" -type f | head -1)
-          codesign --force --sign - "$DYLIB"
-          codesign -dvv "$DYLIB" 2>&1 | head -10
+          codesign --force --sign - artifacts/libSDL3.dylib
+          codesign -dvv artifacts/libSDL3.dylib 2>&1 | head -10
 
       - name: Package artifacts
         run: |
-          mkdir -p artifacts
-          DYLIB=$(find build-ios -name "libSDL3.dylib" -type f | head -1)
-          cp "$DYLIB" artifacts/libSDL3.dylib
           cat > artifacts/BUILD_INFO.txt <<EOF
           SDL3 iOS Build
           ==============
