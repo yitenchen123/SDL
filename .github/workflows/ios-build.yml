@@ -86,6 +86,7 @@ jobs:
             -DSDL_SHARED=ON \
             -DSDL_STATIC=OFF \
             -DSDL_TEST=OFF \
+            -DSDL_TESTS=OFF \
             -DSDL_RENDER=ON \
             -DSDL_VIDEO=ON \
             -DSDL_AUDIO=ON \
