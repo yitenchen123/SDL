@@ -6,6 +6,11 @@ name: Build SDL3 for iOS
 # 产物命名约定（macOS dylib 标准）：
 # - libSDL3.0.dylib：真实库文件（含 LC_ID_DYLIB=@rpath/libSDL3.0.dylib）
 # - libSDL3.dylib：符号链接 → libSDL3.0.dylib（LWJGL 默认查找名）
+#
+# 关键适配：通过 CMAKE_C_FLAGS 全局定义 SDL_MAIN_HANDLED 预处理器宏，
+# 阻止 SDL_main.h 在 iOS 平台定义 SDL_MAIN_NEEDED，使 SDL_MainIsReady
+# 默认为 true，避免 SDL_Init() 抛出 "Application didn't initialize properly"。
+# 原因：MC 的 main 由 JVM 启动器管理，不走 SDL_main 标准流程。
 
 on:
   push:
@@ -43,6 +48,31 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks | grep -i ios
 
+      - name: Verify SDL_MAIN_HANDLED blocks SDL_MAIN_NEEDED
+        run: |
+          cat > /tmp/test_main_needed.c <<'TESTEOF'
+          #include <SDL3/SDL_platform.h>
+          #if !defined(SDL_PLATFORM_IOS)
+          #define SDL_PLATFORM_IOS
+          #endif
+          #include <SDL3/SDL_main.h>
+          #include <stdio.h>
+          int main(void) {
+          #ifdef SDL_MAIN_NEEDED
+              printf("FAIL: SDL_MAIN_NEEDED is DEFINED\n");
+              return 1;
+          #elif defined(SDL_MAIN_HANDLED)
+              printf("PASS: SDL_MAIN_HANDLED active, SDL_MAIN_NEEDED not defined\n");
+              return 0;
+          #else
+              printf("PASS: SDL_MAIN_NEEDED not defined (default)\n");
+              return 0;
+          #endif
+          }
+          TESTEOF
+          clang -DSDL_MAIN_HANDLED=1 -Iinclude /tmp/test_main_needed.c -o /tmp/test_main_needed 2>&1 | head -10
+          /tmp/test_main_needed
+
       - name: Configure CMake (iOS arm64)
         run: |
           mkdir -p build-ios
@@ -51,10 +81,11 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type || 'Release' }} \
+            -DCMAKE_C_FLAGS="-DSDL_MAIN_HANDLED=1" \
+            -DCMAKE_OBJC_FLAGS="-DSDL_MAIN_HANDLED=1" \
             -DSDL_SHARED=ON \
             -DSDL_STATIC=OFF \
             -DSDL_TEST=OFF \
-            -DSDL_MAIN_HANDLED=ON \
             -DSDL_RENDER=ON \
             -DSDL_VIDEO=ON \
             -DSDL_AUDIO=ON \
@@ -81,8 +112,6 @@ jobs:
 
       - name: Install dylib to staged directory
         run: |
-          # 用 cmake --install 把 dylib 安装到固定路径，避免在 build 树中搜索
-          # INSTALL_PREFIX 下会有 lib/libSDL3.0.dylib 和 lib/libSDL3.dylib（符号链接）
           cmake --install build-ios --prefix staged --config ${{ github.event.inputs.build_type || 'Release' }}
           echo "=== Installed files ==="
           ls -la staged/lib/
@@ -109,7 +138,7 @@ jobs:
           otool -D "$DYLIB"
           echo ""
           echo "=== Exported symbols (sample) ==="
-          nm -gU "$DYLIB" 2>/dev/null | grep -E "SDL_SetLogPriorities|SDL_Init|SDL_Quit|SDL_CreateWindow" | head -10
+          nm -gU "$DYLIB" 2>/dev/null | grep -E "SDL_SetLogPriorities|SDL_Init|SDL_Quit|SDL_CreateWindow|SDL_SetMainReady" | head -10
 
       - name: Sign dylib (ad-hoc for iOS)
         run: |
@@ -119,26 +148,20 @@ jobs:
       - name: Package artifacts
         run: |
           mkdir -p artifacts
-          # 复制真实库文件
           cp staged/lib/libSDL3.0.dylib artifacts/libSDL3.0.dylib
-          # 创建符号链接（macOS dylib 标准命名约定）
-          # libSDL3.dylib → libSDL3.0.dylib
-          # git 会存储为符号链接，checkout 时在 macOS/Linux 上都会还原为符号链接
           cd artifacts
           ln -s libSDL3.0.dylib libSDL3.dylib
           ls -la
           cd ..
           cat > artifacts/BUILD_INFO.txt <<EOF
-          SDL3 iOS Build
-          ==============
+          SDL3 iOS Build (with SDL_MAIN_HANDLED)
+          =====================================
           Build Type: ${{ github.event.inputs.build_type || 'Release' }}
           Architecture: arm64
           Deployment Target: iOS 14.0
           Source Commit: ${{ github.sha }}
           Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          Files:
-            - libSDL3.0.dylib (real library, 2.2MB)
-            - libSDL3.dylib (symlink -> libSDL3.0.dylib)
+          Key config: SDL_MAIN_HANDLED=1 (disables SDL_MAIN_NEEDED)
           EOF
 
       - name: Upload libSDL3.dylib
