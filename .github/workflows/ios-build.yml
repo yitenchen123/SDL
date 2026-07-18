@@ -1,0 +1,131 @@
+name: Build SDL3 for iOS
+
+# 构建 iOS arm64 版 libSDL3.dylib，供 PojavLauncher (Amethyst iOS) 集成使用。
+# LWJGL 的 Library.loadNative 期望加载动态库，iOS 支持嵌入动态库。
+#
+# 关键配置：
+# - CMAKE_SYSTEM_NAME=iOS 交叉编译
+# - CMAKE_OSX_ARCHITECTURES=arm64
+# - CMAKE_OSX_DEPLOYMENT_TARGET=14.0 匹配项目最低支持
+# - SDL_SHARED=ON 构建动态库
+# - SDL_MAIN_HANDLED=ON 禁用 SDL main hook（MC 自己管理 main）
+
+on:
+  push:
+    branches: [ main, build-ios ]
+    paths:
+      - '.github/workflows/ios-build.yml'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (Release/Debug)'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout SDL3
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode 15.4
+        run: sudo xcode-select -switch /Applications/Xcode_15.4.app
+
+      - name: Verify iOS SDK
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios
+
+      - name: Configure CMake (iOS arm64)
+        run: |
+          mkdir -p build-ios
+          cmake -B build-ios -S . \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type || 'Release' }} \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF \
+            -DSDL_TEST=OFF \
+            -DSDL_MAIN_HANDLED=ON \
+            -DSDL_RENDER=ON \
+            -DSDL_VIDEO=ON \
+            -DSDL_AUDIO=ON \
+            -DSDL_EVENTS=ON \
+            -DSDL_JOYSTICK=ON \
+            -DSDL_HAPTIC=ON \
+            -DSDL_SENSOR=ON \
+            -DSDL_POWER=ON \
+            -DSDL_THREADS=ON \
+            -DSDL_TIMERS=ON \
+            -DSDL_FILE=ON \
+            -DSDL_LOADSO=ON \
+            -DSDL_CPUINFO=ON \
+            -DSDL_FILESYSTEM=ON \
+            -DSDL_LOCALE=ON \
+            -DSDL_MISC=ON \
+            -DSDL_OPENGL=OFF \
+            -DSDL_OPENGLES=ON \
+            -DSDL_VULKAN=OFF \
+            -DSDL_METAL=ON
+
+      - name: Build libSDL3.dylib
+        run: cmake --build build-ios --config ${{ github.event.inputs.build_type || 'Release' }} --parallel 4 --verbose
+
+      - name: Verify dylib architecture
+        run: |
+          echo "=== Build output ==="
+          find build-ios -name "libSDL3*" -type f 2>/dev/null
+          echo ""
+          DYLIB=$(find build-ios -name "libSDL3.dylib" -type f | head -1)
+          if [ -n "$DYLIB" ]; then
+            file "$DYLIB"
+            echo ""
+            otool -L "$DYLIB" | head -20
+            echo ""
+            echo "=== Exported symbols (sample) ==="
+            nm -gU "$DYLIB" 2>/dev/null | grep -E "SDL_SetLogPriorities|SDL_Init|SDL_Quit|SDL_CreateWindow" | head -10
+          else
+            echo "ERROR: libSDL3.dylib not found"
+            find build-ios -name "*.dylib" -o -name "*.a" 2>/dev/null
+            exit 1
+          fi
+
+      - name: Sign dylib (ad-hoc for iOS)
+        run: |
+          DYLIB=$(find build-ios -name "libSDL3.dylib" -type f | head -1)
+          codesign --force --sign - "$DYLIB"
+          codesign -dvv "$DYLIB" 2>&1 | head -10
+
+      - name: Package artifacts
+        run: |
+          mkdir -p artifacts
+          DYLIB=$(find build-ios -name "libSDL3.dylib" -type f | head -1)
+          cp "$DYLIB" artifacts/libSDL3.dylib
+          cat > artifacts/BUILD_INFO.txt <<EOF
+          SDL3 iOS Build
+          ==============
+          Build Type: ${{ github.event.inputs.build_type || 'Release' }}
+          Architecture: arm64
+          Deployment Target: iOS 14.0
+          Source Commit: ${{ github.sha }}
+          Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          EOF
+          ls -la artifacts/
+
+      - name: Upload libSDL3.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: libSDL3-ios-arm64
+          path: artifacts/
+          retention-days: 90
