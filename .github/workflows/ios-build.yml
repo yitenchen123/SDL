@@ -2,6 +2,10 @@ name: Build SDL3 for iOS
 
 # 构建 iOS arm64 版 libSDL3.dylib，供 PojavLauncher (Amethyst iOS) 集成使用。
 # LWJGL 的 Library.loadNative 期望加载动态库，iOS 支持嵌入动态库。
+#
+# 产物命名约定（macOS dylib 标准）：
+# - libSDL3.0.dylib：真实库文件（含 LC_ID_DYLIB=@rpath/libSDL3.0.dylib）
+# - libSDL3.dylib：符号链接 → libSDL3.0.dylib（LWJGL 默认查找名）
 
 on:
   push:
@@ -75,46 +79,55 @@ jobs:
       - name: Build libSDL3.dylib
         run: cmake --build build-ios --config ${{ github.event.inputs.build_type || 'Release' }} --parallel 4 --verbose
 
-      - name: Verify and package dylib
+      - name: Install dylib to staged directory
         run: |
-          echo "=== Build output ==="
-          find build-ios -name "libSDL3*" 2>/dev/null
-          echo ""
-          # libSDL3.dylib 可能是符号链接（指向 libSDL3.0.dylib），用 -L 跟随符号链接
-          DYLIB=$(find build-ios -name "libSDL3.dylib" 2>/dev/null | head -1)
-          if [ -z "$DYLIB" ]; then
-            DYLIB=$(find build-ios -name "libSDL3.*.dylib" 2>/dev/null | head -1)
-          fi
-          if [ -n "$DYLIB" ]; then
-            echo "Found: $DYLIB"
-            file -L "$DYLIB"
-            echo ""
-            echo "=== otool -L ==="
-            otool -L "$DYLIB" | head -20
-            echo ""
-            echo "=== Exported symbols (sample) ==="
-            nm -gU "$DYLIB" 2>/dev/null | grep -E "SDL_SetLogPriorities|SDL_Init|SDL_Quit|SDL_CreateWindow" | head -10
-            # 如果是符号链接，复制实际文件（保留 dylib 名称）
-            mkdir -p artifacts
-            cp -RL "$DYLIB" artifacts/libSDL3.dylib
-            # 同时复制版本号 dylib（如果是真实文件）
-            VERSIONED=$(find build-ios -name "libSDL3.*.dylib" -type f 2>/dev/null | head -1)
-            if [ -n "$VERSIONED" ] && [ "$VERSIONED" != "$DYLIB" ]; then
-              cp -L "$VERSIONED" artifacts/$(basename "$VERSIONED")
-            fi
-          else
-            echo "ERROR: libSDL3.dylib not found"
+          # 用 cmake --install 把 dylib 安装到固定路径，避免在 build 树中搜索
+          # INSTALL_PREFIX 下会有 lib/libSDL3.0.dylib 和 lib/libSDL3.dylib（符号链接）
+          cmake --install build-ios --prefix staged --config ${{ github.event.inputs.build_type || 'Release' }}
+          echo "=== Installed files ==="
+          ls -la staged/lib/
+
+      - name: Verify dylib architecture
+        run: |
+          DYLIB=staged/lib/libSDL3.0.dylib
+          if [ ! -f "$DYLIB" ]; then
+            echo "ERROR: $DYLIB not found"
             find build-ios -name "*.dylib" -o -name "*.a" 2>/dev/null
             exit 1
           fi
+          echo "=== Real library ==="
+          file "$DYLIB"
+          echo ""
+          echo "=== Symbolic link ==="
+          ls -la staged/lib/libSDL3.dylib
+          readlink staged/lib/libSDL3.dylib
+          echo ""
+          echo "=== otool -L ==="
+          otool -L "$DYLIB" | head -20
+          echo ""
+          echo "=== LC_ID_DYLIB ==="
+          otool -D "$DYLIB"
+          echo ""
+          echo "=== Exported symbols (sample) ==="
+          nm -gU "$DYLIB" 2>/dev/null | grep -E "SDL_SetLogPriorities|SDL_Init|SDL_Quit|SDL_CreateWindow" | head -10
 
       - name: Sign dylib (ad-hoc for iOS)
         run: |
-          codesign --force --sign - artifacts/libSDL3.dylib
-          codesign -dvv artifacts/libSDL3.dylib 2>&1 | head -10
+          codesign --force --sign - staged/lib/libSDL3.0.dylib
+          codesign -dvv staged/lib/libSDL3.0.dylib 2>&1 | head -10
 
       - name: Package artifacts
         run: |
+          mkdir -p artifacts
+          # 复制真实库文件
+          cp staged/lib/libSDL3.0.dylib artifacts/libSDL3.0.dylib
+          # 创建符号链接（macOS dylib 标准命名约定）
+          # libSDL3.dylib → libSDL3.0.dylib
+          # git 会存储为符号链接，checkout 时在 macOS/Linux 上都会还原为符号链接
+          cd artifacts
+          ln -s libSDL3.0.dylib libSDL3.dylib
+          ls -la
+          cd ..
           cat > artifacts/BUILD_INFO.txt <<EOF
           SDL3 iOS Build
           ==============
@@ -123,8 +136,10 @@ jobs:
           Deployment Target: iOS 14.0
           Source Commit: ${{ github.sha }}
           Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Files:
+            - libSDL3.0.dylib (real library, 2.2MB)
+            - libSDL3.dylib (symlink -> libSDL3.0.dylib)
           EOF
-          ls -la artifacts/
 
       - name: Upload libSDL3.dylib
         uses: actions/upload-artifact@v4
